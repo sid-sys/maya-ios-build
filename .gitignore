@@ -1,0 +1,12 @@
+# This repository holds one workflow and nothing else. Anything below turning up
+# here means something was copied in by mistake.
+*.p12
+*.p8
+*.pem
+*.mobileprovision
+*.jks
+*.keystore
+.env
+.env.*
+GoogleService-Info.plist
+google-services.json

@@ -1,0 +1,130 @@
+# Builds the iOS app on GitHub's macOS runners, from a PRIVATE source repository.
+#
+# This file lives in a PUBLIC repository and is the only thing in it that
+# matters. GitHub-hosted runners are free and unlimited for a public repo,
+# whereas on a private one a macOS minute is billed at ten times the Linux
+# rate. iOS can only be built on macOS, so the build has to run from here.
+#
+# The source code is not here. It is fetched into the runner at build time with
+# a read-only deploy key that exists only as a secret on this repository, and
+# it is gone when the job ends. Nothing about the app is published.
+#
+# The one leak that design has is the log. This repository is public, so its
+# build logs are too, and a compile error prints the line of code that caused
+# it. So every step that touches the source writes to a file instead of the
+# console, and if the build fails the logs are uploaded ENCRYPTED. A success
+# prints one line. A failure prints a count.
+#
+# Secrets this needs, both set on this repository:
+#   SOURCE_DEPLOY_KEY   private half of a read-only deploy key on the source repo
+#   LOG_PASSPHRASE      long random string; encrypts the logs of a failed build
+#
+# Nothing here signs or ships the app. That is a separate job, and it needs an
+# Apple Developer account this repository does not have yet.
+
+name: iOS build
+
+# Manual only. A push to this repository changes nothing about the app, so
+# there is nothing for it to build; the button is the whole interface. It also
+# means no pull request can ever start a job that holds these secrets.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit of the private source to build"
+        required: true
+        default: master
+
+# A second run replaces one still going. macOS is the slow part of the pipeline
+# and there is only ever one build worth waiting for.
+concurrency:
+  group: ios-build
+  cancel-in-progress: true
+
+# Read-only. The job has no reason to write to this repository.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (unsigned)
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    env:
+      LOG_PASSPHRASE: ${{ secrets.LOG_PASSPHRASE }}
+
+    steps:
+      - name: Fetch the private source
+        uses: actions/checkout@v4
+        with:
+          repository: sid-sys/astra-manifest-anything
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: app
+          fetch-depth: 1
+          # Drops the key from the runner's git config once the code is here.
+          persist-credentials: false
+
+      # The toolchain the app is built with on the developer's machine.
+      # pubspec.lock pins the packages; this pins what resolves them. Floating
+      # on "stable" is how a green build goes red on a day nobody changed
+      # anything.
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.47.1
+          cache: true
+
+      - name: Toolchain
+        run: |
+          flutter --version | head -1
+          xcodebuild -version | head -1
+          mkdir -p "$RUNNER_TEMP/logs"
+
+      - name: Packages
+        working-directory: app
+        run: |
+          flutter pub get > "$RUNNER_TEMP/logs/pub.log" 2>&1 \
+            || { echo "::error::flutter pub get failed"; exit 1; }
+          echo "packages resolved"
+
+      # Errors and warnings fail the build. Info-level lints do not: those are
+      # style, they were already in the code, and a build that goes red over one
+      # is a build people learn to ignore.
+      - name: Analyze
+        working-directory: app
+        run: |
+          flutter analyze lib --no-fatal-infos > "$RUNNER_TEMP/logs/analyze.log" 2>&1
+          status=$?
+          echo "analyzer: $(grep -cE '^ +error ' "$RUNNER_TEMP/logs/analyze.log") errors," \
+               "$(grep -cE '^ +warning ' "$RUNNER_TEMP/logs/analyze.log") warnings," \
+               "$(grep -cE '^ +info ' "$RUNNER_TEMP/logs/analyze.log") infos"
+          exit $status
+
+      - name: Build iOS (no codesign)
+        working-directory: app
+        run: |
+          flutter build ios --release --no-codesign > "$RUNNER_TEMP/logs/build.log" 2>&1 \
+            || { echo "::error::iOS build failed (log kept, encrypted)"; exit 1; }
+          du -sh build/ios/iphoneos/Runner.app
+          echo "iOS build succeeded"
+
+      # Encrypted with a passphrase only the owner holds, so the artifact can sit
+      # on a public repository without publishing what is in it. Salted AES; the
+      # passphrase is 256 bits of randomness, so the weak key derivation that
+      # older openssl builds on macOS are limited to does not matter.
+      - name: Keep the logs, encrypted
+        if: failure() && env.LOG_PASSPHRASE != ''
+        run: |
+          tar -czf "$RUNNER_TEMP/logs.tgz" -C "$RUNNER_TEMP/logs" .
+          openssl enc -aes-256-cbc -md sha256 -salt -pass env:LOG_PASSPHRASE \
+            -in "$RUNNER_TEMP/logs.tgz" -out "$RUNNER_TEMP/build-logs.enc"
+
+      - name: Upload the encrypted logs
+        if: failure() && env.LOG_PASSPHRASE != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-encrypted
+          path: ${{ runner.temp }}/build-logs.enc
+          retention-days: 3
